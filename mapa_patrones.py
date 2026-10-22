@@ -188,7 +188,8 @@ def cargar_meta_json():
 
 
 
-def construir_demo(n_patrones=18, n_tickets=2500, seed=7):
+def construir_demo(n_patrones=18, n_tickets=2500, seed=7, ruido=1.15, cruzados=0.08,
+                   mezcla=0.35, peso_mezcla=0.5):
     """Dataset 100% sintetico: permite publicar el repo sin datos reales.
 
     Genera n_patrones centroides en 768d, les asigna tickets con ruido y
@@ -201,11 +202,20 @@ def construir_demo(n_patrones=18, n_tickets=2500, seed=7):
     centros = _norm(rng.normal(size=(n_patrones, DIM)).astype(np.float32))
     cluster = rng.integers(1, n_patrones + 1, n_tickets).astype(np.int32)
     # ruido normalizado: en 768d un gaussiano crudo tiene norma ~27 y tapa los clusters
-    ruido = _norm(rng.normal(size=(n_tickets, DIM)).astype(np.float32))
-    X = _norm(centros[cluster - 1] + 0.78 * ruido)
+    ruido_unit = _norm(rng.normal(size=(n_tickets, DIM)).astype(np.float32))
+    # mezcla: una fraccion de tickets queda a mitad de camino entre su cluster y el vecino,
+    # lo que produce solapamiento real (puentes) en la proyeccion
+    vecino = ((cluster % n_patrones) + 1).astype(np.int32)
+    mezclar = rng.random(n_tickets) < mezcla
+    base_vec = centros[cluster - 1]
+    if mezclar.any():
+        base_vec = base_vec.copy()
+        base_vec[mezclar] = (peso_mezcla * centros[cluster[mezclar] - 1]
+                             + (1 - peso_mezcla) * centros[vecino[mezclar] - 1])
+    X = _norm(base_vec + ruido * ruido_unit)
     # 8% de etiquetas cruzadas: el demo muestra el desacuerdo entre patrón asignado y vector
     pids = cluster.copy()
-    cruz = rng.random(n_tickets) < 0.08
+    cruz = rng.random(n_tickets) < cruzados
     if cruz.any():
         pids[cruz] = rng.integers(1, n_patrones + 1, int(cruz.sum())).astype(np.int32)
     tids = np.arange(1_000_001, 1_000_001 + n_tickets, dtype=np.int64)
@@ -230,7 +240,8 @@ def construir_demo(n_patrones=18, n_tickets=2500, seed=7):
     todo = np.vstack([X, centros])
     pca50 = PCA(n_components=50, random_state=0).fit(todo)
     var50 = float(pca50.explained_variance_ratio_.sum() * 100)
-    print(f"[demo] {n_tickets} tickets sintéticos · {n_patrones} patrones · PCA 50 dims {var50:.1f}%")
+    print(f"[demo] {n_tickets} tickets sintéticos · {n_patrones} patrones · "
+          f"ruido {ruido} · mezcla {mezcla:.0%} · cruzados {cruzados:.0%} · PCA 50 dims {var50:.1f}%")
     ts = TSNE(n_components=2, perplexity=min(40, max(5, n_tickets // 60)), init='pca',
               random_state=0, max_iter=750, n_jobs=-1, metric='cosine')
     xy = ts.fit_transform(pca50.transform(X)).astype(np.float32)
@@ -910,10 +921,18 @@ def main():
                     help='regenera el HTML con la base cacheada, sin tocar la DB')
     ap.add_argument('--demo', action='store_true',
                     help='genera un mapa con datos sinteticos (no toca la DB ni usa datos reales)')
+    ap.add_argument('--demo-ruido', type=float, default=1.15,
+                    help='dispersion de los clusters sinteticos (mas alto = mas superpuestos)')
+    ap.add_argument('--demo-cruzados', type=float, default=0.08,
+                    help='fraccion de tickets con etiqueta cruzada (0 a 1)')
+    ap.add_argument('--demo-mezcla', type=float, default=0.35,
+                    help='fraccion de tickets a mitad de camino entre dos patrones (solapamiento)')
     args = ap.parse_args()
 
     if args.demo:
-        construir_html(construir_demo(), 'demo.html')
+        base = construir_demo(ruido=args.demo_ruido, cruzados=args.demo_cruzados,
+                              mezcla=args.demo_mezcla)
+        construir_html(base, 'demo.html')
         return
 
     params = (args.patrones, args.tickets_por_patron)

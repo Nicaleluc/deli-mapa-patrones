@@ -17,7 +17,9 @@ py -m pip install -r requirements.txt
 py -u mapa_patrones.py --demo      # genera salida/demo.html (2.500 tickets falsos, 18 patrones)
 ```
 
-No necesita base de datos ni credenciales.
+No necesita base de datos ni credenciales. El aspecto del demo se ajusta con
+`--demo-mezcla` (fracción de tickets a mitad de camino entre dos patrones → solapamiento),
+`--demo-ruido` (dispersión interna) y `--demo-cruzados` (etiquetas mal asignadas).
 
 ## Qué hace
 
