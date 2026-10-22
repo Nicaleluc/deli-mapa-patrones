@@ -189,7 +189,7 @@ def cargar_meta_json():
 
 
 def construir_demo(n_patrones=18, n_tickets=2500, seed=7, ruido=1.15, cruzados=0.08,
-                   mezcla=0.35, peso_mezcla=0.5):
+                   mezcla=0.15, peso_mezcla=0.5, compactacion=0.70, perp=20):
     """Dataset 100% sintetico: permite publicar el repo sin datos reales.
 
     Genera n_patrones centroides en 768d, les asigna tickets con ruido y
@@ -200,6 +200,10 @@ def construir_demo(n_patrones=18, n_tickets=2500, seed=7, ruido=1.15, cruzados=0
 
     rng = np.random.default_rng(seed)
     centros = _norm(rng.normal(size=(n_patrones, DIM)).astype(np.float32))
+    if compactacion > 0:
+        # acerca los centroides hacia su direccion media: menos hueco entre grupos
+        media = _norm(centros.mean(axis=0, keepdims=True))
+        centros = _norm((1 - compactacion) * centros + compactacion * media)
     cluster = rng.integers(1, n_patrones + 1, n_tickets).astype(np.int32)
     # ruido normalizado: en 768d un gaussiano crudo tiene norma ~27 y tapa los clusters
     ruido_unit = _norm(rng.normal(size=(n_tickets, DIM)).astype(np.float32))
@@ -240,9 +244,11 @@ def construir_demo(n_patrones=18, n_tickets=2500, seed=7, ruido=1.15, cruzados=0
     todo = np.vstack([X, centros])
     pca50 = PCA(n_components=50, random_state=0).fit(todo)
     var50 = float(pca50.explained_variance_ratio_.sum() * 100)
+    perplexity = perp or min(40, max(5, n_tickets // 60))
     print(f"[demo] {n_tickets} tickets sintéticos · {n_patrones} patrones · "
-          f"ruido {ruido} · mezcla {mezcla:.0%} · cruzados {cruzados:.0%} · PCA 50 dims {var50:.1f}%")
-    ts = TSNE(n_components=2, perplexity=min(40, max(5, n_tickets // 60)), init='pca',
+          f"ruido {ruido} · mezcla {mezcla:.0%} · compactación {compactacion} · "
+          f"perp {perplexity} · PCA 50 dims {var50:.1f}%")
+    ts = TSNE(n_components=2, perplexity=perplexity, init='pca',
               random_state=0, max_iter=750, n_jobs=-1, metric='cosine')
     xy = ts.fit_transform(pca50.transform(X)).astype(np.float32)
     print("[demo] t-SNE listo")
@@ -925,13 +931,18 @@ def main():
                     help='dispersion de los clusters sinteticos (mas alto = mas superpuestos)')
     ap.add_argument('--demo-cruzados', type=float, default=0.08,
                     help='fraccion de tickets con etiqueta cruzada (0 a 1)')
-    ap.add_argument('--demo-mezcla', type=float, default=0.35,
+    ap.add_argument('--demo-mezcla', type=float, default=0.15,
                     help='fraccion de tickets a mitad de camino entre dos patrones (solapamiento)')
+    ap.add_argument('--demo-compacidad', type=float, default=0.70,
+                    help='0-1: acerca los centroides entre si (menos espacio entre grupos)')
+    ap.add_argument('--demo-perp', type=int, default=20,
+                    help='perplexity del t-SNE (0 = automatico segun cantidad de puntos)')
     args = ap.parse_args()
 
     if args.demo:
         base = construir_demo(ruido=args.demo_ruido, cruzados=args.demo_cruzados,
-                              mezcla=args.demo_mezcla)
+                              mezcla=args.demo_mezcla, compactacion=args.demo_compacidad,
+                              perp=args.demo_perp or None)
         construir_html(base, 'demo.html')
         return
 

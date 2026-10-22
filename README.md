@@ -17,9 +17,15 @@ py -m pip install -r requirements.txt
 py -u mapa_patrones.py --demo      # genera salida/demo.html (2.500 tickets falsos, 18 patrones)
 ```
 
-No necesita base de datos ni credenciales. El aspecto del demo se ajusta con
-`--demo-mezcla` (fracción de tickets a mitad de camino entre dos patrones → solapamiento),
-`--demo-ruido` (dispersión interna) y `--demo-cruzados` (etiquetas mal asignadas).
+No necesita base de datos ni credenciales. El aspecto del demo se ajusta con:
+
+| Flag | Default | Efecto |
+|---|---|---|
+| `--demo-compacidad` | 0.70 | acerca los centroides entre sí: menos espacio libre entre grupos |
+| `--demo-mezcla` | 0.15 | fracción de tickets a mitad de camino entre dos patrones |
+| `--demo-perp` | 20 | perplexity del t-SNE (0 = automático) |
+| `--demo-ruido` | 1.15 | dispersión interna de cada grupo |
+| `--demo-cruzados` | 0.08 | fracción de etiquetas mal asignadas |
 
 ## Qué hace
 
