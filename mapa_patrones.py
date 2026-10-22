@@ -49,6 +49,37 @@ def _norm(X):
     return X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
 
 
+def _proyectar(X, P, metodo="tsne", perp=None, seed=0):
+    """PCA50 + (t-SNE | UMAP) sobre los tickets. Devuelve (xy, var50, metodo_usado)."""
+    from sklearn.decomposition import PCA
+
+    todo = np.vstack([X, P])
+    pca50 = PCA(n_components=50, random_state=seed).fit(todo)
+    var50 = float(pca50.explained_variance_ratio_.sum() * 100)
+    X50 = pca50.transform(X)
+
+    if metodo == "umap":
+        try:
+            import umap
+            print(f"[proy] PCA 50 dims {var50:.1f}% · UMAP (cosine) ...")
+            xy = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="cosine",
+                           random_state=seed).fit_transform(X50)
+            print("[proy] UMAP listo")
+            return xy.astype(np.float32), var50, "umap"
+        except ImportError:
+            print("[proy] umap-learn no instalado; se usa t-SNE "
+                  "(pip install umap-learn)")
+
+    from sklearn.manifold import TSNE
+    perp = perp or min(40, max(5, len(X) // 60))
+    print(f"[proy] PCA 50 dims {var50:.1f}% · t-SNE (cosine, perp {perp}) ...")
+    ts = TSNE(n_components=2, perplexity=perp, init="pca", random_state=seed,
+              max_iter=900, n_jobs=-1, metric="cosine")
+    xy = ts.fit_transform(X50).astype(np.float32)
+    print("[proy] t-SNE listo")
+    return xy, var50, "tsne"
+
+
 def _meta_patrones(cur):
     cur.execute(f"SELECT {CAMPOS} FROM DS_Patron p WITH (NOLOCK) WHERE p.Estado = 'activo'")
     meta = {}
@@ -79,7 +110,7 @@ def _vectores_patrones(cur):
     return np.array(ids, dtype=np.int32), _norm(np.vstack(vecs)), meta
 
 
-def construir_base(cur, top_patrones, por_patron, min_ticket=400000):
+def construir_base(cur, top_patrones, por_patron, min_ticket=400000, metodo='tsne'):
     ids_all, P_all, meta_all = _vectores_patrones(cur)
     print(f"[base] {len(ids_all)} patrones activos con embedding")
 
@@ -138,28 +169,20 @@ def construir_base(cur, top_patrones, por_patron, min_ticket=400000):
     X = _norm(np.vstack([vectores[int(t)] for t in tids]))
     print(f"[base] matriz de tickets: {X.shape}")
 
-    from sklearn.decomposition import PCA
-    from sklearn.manifold import TSNE
-
-    todo = np.vstack([X, P_all])
-    pca50 = PCA(n_components=50, random_state=0).fit(todo)
-    var50 = float(pca50.explained_variance_ratio_.sum() * 100)
-    print(f"[base] PCA 50 dims retiene {var50:.1f}% de la varianza; t-SNE...")
-    ts = TSNE(n_components=2, perplexity=40, init='pca', random_state=0,
-              max_iter=900, n_jobs=-1, metric='cosine')
-    xy = ts.fit_transform(pca50.transform(X)).astype(np.float32)
-    print("[base] t-SNE listo")
+    xy, var50, metodo_usado = _proyectar(X, P_all, metodo=metodo)
 
     np.savez_compressed(
         os.path.join(OUT, 'base.npz'),
         X=X, xy=xy, ticketIds=tids, patronIds=pids,
         P=P_all, patronVecIds=ids_all, var50=np.array([var50], dtype=np.float32),
         params=np.array([top_patrones, por_patron], dtype=np.int32),
-        desde=np.array([min_ticket], dtype=np.int64))
+        desde=np.array([min_ticket], dtype=np.int64),
+        metodo=np.array([0 if metodo_usado == 'tsne' else 1], dtype=np.int32))
     with open(os.path.join(OUT, 'base_meta.json'), 'w', encoding='utf-8') as fh:
         json.dump({str(k): v for k, v in meta_all.items()}, fh, ensure_ascii=False)
     return dict(X=X, xy=xy, tids=tids, pids=pids, P=P_all, pmid=ids_all,
-                meta=meta_all, var50=var50, params=(top_patrones, por_patron))
+                meta=meta_all, var50=var50, params=(top_patrones, por_patron),
+                metodo=metodo_usado)
 
 
 def cargar_base(params, min_ticket=400000):
@@ -189,15 +212,13 @@ def cargar_meta_json():
 
 
 def construir_demo(n_patrones=18, n_tickets=2500, seed=7, ruido=1.15, cruzados=0.08,
-                   mezcla=0.15, peso_mezcla=0.5, compactacion=0.70, perp=20):
+                   mezcla=0.15, peso_mezcla=0.5, compactacion=0.70, perp=20,
+                   metodo='tsne'):
     """Dataset 100% sintetico: permite publicar el repo sin datos reales.
 
     Genera n_patrones centroides en 768d, les asigna tickets con ruido y
     proyecta igual que la base real (PCA50 + t-SNE coseno).
     """
-    from sklearn.decomposition import PCA
-    from sklearn.manifold import TSNE
-
     rng = np.random.default_rng(seed)
     centros = _norm(rng.normal(size=(n_patrones, DIM)).astype(np.float32))
     if compactacion > 0:
@@ -241,17 +262,12 @@ def construir_demo(n_patrones=18, n_tickets=2500, seed=7, ruido=1.15, cruzados=0
             prioridad=prioridades[i % len(prioridades)],
             tipogestion=gestiones[i % len(gestiones)])
 
-    todo = np.vstack([X, centros])
-    pca50 = PCA(n_components=50, random_state=0).fit(todo)
-    var50 = float(pca50.explained_variance_ratio_.sum() * 100)
+    xy, var50, metodo_usado = _proyectar(X, centros, metodo=metodo, perp=perp)
     perplexity = perp or min(40, max(5, n_tickets // 60))
     print(f"[demo] {n_tickets} tickets sintéticos · {n_patrones} patrones · "
           f"ruido {ruido} · mezcla {mezcla:.0%} · compactación {compactacion} · "
           f"perp {perplexity} · PCA 50 dims {var50:.1f}%")
-    ts = TSNE(n_components=2, perplexity=perplexity, init='pca',
-              random_state=0, max_iter=750, n_jobs=-1, metric='cosine')
-    xy = ts.fit_transform(pca50.transform(X)).astype(np.float32)
-    print("[demo] t-SNE listo")
+
 
     return dict(X=X, xy=xy, tids=tids, pids=pids, P=centros,
                 pmid=np.arange(1, n_patrones + 1, dtype=np.int32),
@@ -365,6 +381,9 @@ td,th{padding:4px 2px;border-bottom:1px solid #eef2f7;text-align:left;vertical-a
 th{color:var(--muted);font-weight:600;font-size:10.5px;text-transform:uppercase}
 .mono{font-variant-numeric:tabular-nums}
 .sum{color:var(--muted);font-size:11px;padding:4px 0 2px}
+.selcard{position:absolute;bottom:10px;left:10px;width:310px;max-height:250px;overflow:auto;
+  background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 11px;
+  box-shadow:0 8px 24px rgba(15,23,42,.12);z-index:5}
 .knn{position:absolute;top:10px;right:10px;width:322px;max-height:430px;overflow:auto;
   background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 11px;
   box-shadow:0 8px 24px rgba(15,23,42,.12);z-index:5}
@@ -397,6 +416,12 @@ th{color:var(--muted);font-weight:600;font-size:10.5px;text-transform:uppercase}
 
   <div class="card stage">
     <canvas id="cv"></canvas>
+    <div id="selCard" class="selcard" style="display:none">
+      <div class="knnh"><b id="selTit">Selección</b>
+        <span><button id="selCsv" class="mini">CSV</button>
+        <button id="selClear" class="mini">×</button></span></div>
+      <div id="selBody"></div>
+    </div>
     <div id="knnCard" class="knn" style="display:none">
       <div class="knnh"><b id="knnTit">K-NN · K=7</b><button id="knnClose" class="mini">×</button></div>
       <div id="knnBody"></div>
@@ -407,6 +432,8 @@ th{color:var(--muted);font-weight:600;font-size:10.5px;text-transform:uppercase}
       <button id="zoomOut">−</button>
       <button id="quitarPunto">quitar punto</button>
       <button id="zoomPunto">zoom al punto</button>
+      <button id="btnLazo">lazo</button>
+      <label class="sub" style="margin:0 0 0 6px"><input id="chkDens" type="checkbox"> densidad</label>
       <label class="sub" style="margin:0 0 0 6px">K
         <input id="kIn" type="number" min="1" max="60" step="1" value="7" style="width:56px;text-align:center">
       </label>
@@ -438,6 +465,7 @@ const cv=document.getElementById('cv'), ctx=cv.getContext('2d'), tip=document.ge
 let W=0,H=0,esc=1,ox=0,oy=0,hover=null,drag=null,puntoPx=2.4;
 let puntoKNN=null, resKNN=null;
 let K=7, UMBRAL=0.8;
+let mostrarDens=false, modoLazo=false, lazo=null, lazoListo=false, seleccion=[];
 const dpr=Math.min(2, window.devicePixelRatio||1);
 
 // ---------- colores ----------
@@ -487,12 +515,14 @@ function valores(f){
   return arr.sort((a,b)=>cnt[f.k].get(b)-cnt[f.k].get(a)||a.localeCompare(b));
 }
 let visPat=new Set();
+let visPts=[];
 function patronVisible(p){
   for(const f of FACETS) if(!sel[f.k].has(f.get(p))) return false;
   return true;
 }
 function recomputar(){
   visPat=new Set(D.patrones.filter(patronVisible).map(p=>p.id));
+  visPts=D.puntos.filter(p=>visPat.has(p.p));
   const puntosVis=D.puntos.reduce((a,p)=>a+(visPat.has(p.p)?1:0),0);
   document.getElementById('resumen').innerHTML=
     `<b>${visPat.size}</b> de ${D.patrones.length} patrones · <b>${puntosVis}</b> de ${D.puntos.length} tickets`;
@@ -566,8 +596,7 @@ function pintarLista(f){
 // Voto SECUNDARIO: patron mas cercano por coseno 768D de cada vecino (lo que diria el matcher).
 function calcularKNN(pt){
   const cand=[];
-  D.puntos.forEach(p=>{
-    if(!visPat.has(p.p)) return;
+  visPts.forEach(p=>{
     const dx=p.x-pt.x, dy=p.y-pt.y;
     cand.push({p, d:Math.sqrt(dx*dx+dy*dy)});
   });
@@ -724,14 +753,47 @@ function drawGrid(){
   ctx.fillText('t-SNE 1',8,H-4);
   ctx.save(); ctx.translate(12,16); ctx.rotate(Math.PI/2); ctx.fillText('t-SNE 2',0,0); ctx.restore();
 }
+const densCanvas=document.createElement('canvas');
+function dibujarDensidad(){
+  const G=110, g=densCanvas.getContext('2d');
+  densCanvas.width=G; densCanvas.height=G;
+  const img=g.createImageData(G,G);
+  const counts=new Float32Array(G*G);
+  visPts.forEach(p=>{
+    const gx=Math.floor(tx(p.x)/W*(G-1)), gy=Math.floor(ty(p.y)/H*(G-1));
+    if(gx>=0&&gy>=0&&gx<G&&gy<G) counts[gy*G+gx]++;
+  });
+  const sm=new Float32Array(G*G);
+  for(let y=0;y<G;y++)for(let x=0;x<G;x++){
+    let acc=0,n=0;
+    for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){
+      const yy=y+dy,xx=x+dx;
+      if(yy<0||xx<0||yy>=G||xx>=G) continue;
+      const w=1/(1+Math.abs(dx)+Math.abs(dy));
+      acc+=counts[yy*G+xx]*w; n+=w;
+    }
+    sm[y*G+x]=acc/n;
+  }
+  let mx=1e-9; for(const v of sm) if(v>mx) mx=v;
+  for(let i=0;i<G*G;i++){
+    const a=Math.max(0, Math.min(1, (sm[i]/mx-0.06)/0.94));
+    const d=img.data, o=i*4;
+    d[o]=Math.round(255-218*a); d[o+1]=Math.round(255-140*a); d[o+2]=255;
+    d[o+3]=Math.round(165*a);
+  }
+  g.putImageData(img,0,0);
+  ctx.save(); ctx.imageSmoothingEnabled=true;
+  ctx.globalAlpha=0.85; ctx.drawImage(densCanvas,0,0,W,H); ctx.restore();
+}
+
 function draw(){
   if(!W||!H) return;
   ctx.clearRect(0,0,W,H); ctx.fillStyle='#fff'; ctx.fillRect(0,0,W,H);
   drawGrid();
-  ctx.globalAlpha=0.45;
+  if(mostrarDens) dibujarDensidad();
+  ctx.globalAlpha=mostrarDens?0.30:0.45;
   const r=puntoPx;
-  D.puntos.forEach(p=>{
-    if(!visPat.has(p.p)) return;
+  visPts.forEach(p=>{
     const pat=byId.get(p.p); if(!pat) return;
     ctx.fillStyle=col(pat);
     ctx.fillRect(tx(p.x)-r/2, ty(p.y)-r/2, r, r);
@@ -783,12 +845,69 @@ function draw(){
     ctx.fillStyle='rgba(255,255,255,.9)'; ctx.fillRect(px+15,py-11,w+6,16);
     ctx.fillStyle=pt?col(pt):'#111827'; ctx.fillText(et,px+18,py+2);
   }
+  // seleccion por lazo
+  if(seleccion.length){
+    ctx.save();
+    ctx.strokeStyle='rgba(17,24,39,.85)'; ctx.lineWidth=1.2;
+    seleccion.forEach(p=>{ ctx.beginPath(); ctx.arc(tx(p.x),ty(p.y),4,0,6.2832); ctx.stroke(); });
+    ctx.restore();
+  }
+  if(lazo && lazo.length>1){
+    ctx.save();
+    ctx.strokeStyle='rgba(37,99,235,.9)'; ctx.lineWidth=1.6; ctx.setLineDash([5,4]);
+    ctx.fillStyle='rgba(37,99,235,.08)';
+    ctx.beginPath(); ctx.moveTo(lazo[0].x,lazo[0].y);
+    for(let i=1;i<lazo.length;i++) ctx.lineTo(lazo[i].x,lazo[i].y);
+    if(lazoListo) ctx.closePath();
+    ctx.fill(); ctx.stroke(); ctx.restore();
+  }
+}
+
+function dentroPoligono(pol,x,y){
+  let inside=false;
+  for(let i=0,j=pol.length-1;i<pol.length;j=i++){
+    const xi=pol[i].x, yi=pol[i].y, xj=pol[j].x, yj=pol[j].y;
+    if(((yi>y)!==(yj>y)) && (x < (xj-xi)*(y-yi)/((yj-yi)||1e-9)+xi)) inside=!inside;
+  }
+  return inside;
+}
+function cerrarLazo(){
+  if(!lazo || lazo.length<3){ lazo=null; lazoListo=false; draw(); return; }
+  lazoListo=true;
+  seleccion=visPts.filter(p=>dentroPoligono(lazo, tx(p.x), ty(p.y)));
+  pintarSeleccion(); draw();
+}
+function pintarSeleccion(){
+  const card=document.getElementById('selCard'), body=document.getElementById('selBody');
+  if(!seleccion.length){ card.style.display='none'; return; }
+  card.style.display='block';
+  document.getElementById('selTit').textContent='Selección: '+seleccion.length+' tickets';
+  const cnt={}; seleccion.forEach(p=>{cnt[p.p]=(cnt[p.p]||0)+1;});
+  const top=Object.entries(cnt).sort((a,b)=>b[1]-a[1]).slice(0,6);
+  body.innerHTML='<table><tr><th>Patrón</th><th>tickets</th></tr>'+
+    top.map(([id,n])=>{const pp=byId.get(+id);
+      return `<tr><td><b>#${id}</b> ${pp?pp.categoria:''}</td><td class="mono">${n}</td></tr>`;}).join('')+
+    '</table><div class="sub" style="margin-top:6px">'+Object.keys(cnt).length+' patrones distintos</div>';
+}
+function bajarCSV(){
+  if(!seleccion.length) return;
+  const filas=[['ticket','patron','categoria','producto','prioridad','prioridad','x','y']];
+  seleccion.forEach(p=>{
+    const pp=byId.get(p.p)||{};
+    filas.push([p.i,p.p,pp.categoria||'',pp.producto||'',pp.prioridad||'',p.x,p.y]);
+  });
+  const csv=filas.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(';')).join('\r\n');
+  const blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8;'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='seleccion_tickets.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
 
 function cerca(mx,my){
   let best=null,bd=Math.max(70, puntoPx*puntoPx*4);
-  D.puntos.forEach(p=>{
-    if(!visPat.has(p.p)) return;
+  visPts.forEach(p=>{
     const dx=tx(p.x)-mx,dy=ty(p.y)-my,d=dx*dx+dy*dy;
     if(d<bd){bd=d;best={tipo:'punto',obj:p};}
   });
@@ -796,6 +915,11 @@ function cerca(mx,my){
 }
 cv.addEventListener('mousemove',e=>{
   const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+  if(modoLazo && lazo){
+    const ult=lazo[lazo.length-1];
+    if(Math.hypot(mx-ult.x,my-ult.y)>2.5){ lazo.push({x:mx,y:my}); draw(); }
+    return;
+  }
   if(drag){
     if(!drag.moved && Math.hypot(mx-drag.x0,my-drag.y0)>4) drag.moved=true;
     if(drag.moved){
@@ -818,10 +942,14 @@ cv.addEventListener('mouseleave',()=>{tip.style.opacity=0;if(hover){hover=null;d
 cv.addEventListener('mousedown',e=>{
   const r=cv.getBoundingClientRect();
   const mx=e.clientX-r.left, my=e.clientY-r.top;
+  if(modoLazo){
+    lazo=[{x:mx,y:my}]; lazoListo=false; draw(); return;
+  }
   drag={x0:mx,y0:my,x:mx,y:my,moved:false};
   cv.classList.add('drag');
 });
 window.addEventListener('mouseup',e=>{
+  if(modoLazo && lazo){ cerrarLazo(); return; }
   if(drag && !drag.moved){
     const r=cv.getBoundingClientRect();
     const mx=e.clientX-r.left, my=e.clientY-r.top;
@@ -850,6 +978,19 @@ document.getElementById('zoomPunto').onclick=()=>{
   esc=Math.min(W,H)*0.30/Math.max(ref,0.05);
   ox=W/2-puntoKNN.x*esc; oy=H/2+puntoKNN.y*esc;
   draw();
+};
+document.getElementById('btnLazo').onclick=()=>{
+  modoLazo=!modoLazo;
+  document.getElementById('btnLazo').style.background = modoLazo?'#e0e7ff':'';
+  cv.style.cursor = modoLazo?'crosshair':'grab';
+  if(!modoLazo){ lazo=null; lazoListo=false; }
+  draw();
+};
+document.getElementById('chkDens').onchange=e=>{mostrarDens=e.target.checked;draw();};
+document.getElementById('selCsv').onclick=bajarCSV;
+document.getElementById('selClear').onclick=()=>{
+  seleccion=[]; lazo=null; lazoListo=false;
+  document.getElementById('selCard').style.display='none'; draw();
 };
 document.getElementById('quitarPunto').onclick=()=>{
   puntoKNN=null; resKNN=null;
@@ -922,6 +1063,8 @@ def main():
     ap.add_argument('--tickets-por-patron', type=int, default=55)
     ap.add_argument('--desde', type=int, default=400000,
                     help='TicketId minimo a muestrear (400000 por defecto; 0 = todo el historial)')
+    ap.add_argument('--metodo', choices=['tsne', 'umap'], default='tsne',
+                    help='proyeccion 2D: t-SNE (default) o UMAP (requiere umap-learn)')
     ap.add_argument('--refresh', action='store_true')
     ap.add_argument('--offline', action='store_true',
                     help='regenera el HTML con la base cacheada, sin tocar la DB')
@@ -942,7 +1085,7 @@ def main():
     if args.demo:
         base = construir_demo(ruido=args.demo_ruido, cruzados=args.demo_cruzados,
                               mezcla=args.demo_mezcla, compactacion=args.demo_compacidad,
-                              perp=args.demo_perp or None)
+                              perp=args.demo_perp or None, metodo=args.metodo)
         construir_html(base, 'demo.html')
         return
 
@@ -963,7 +1106,8 @@ def main():
     try:
         base = None if args.refresh else cargar_base(params, args.desde)
         if base is None:
-            base = construir_base(cur, args.patrones, args.tickets_por_patron, args.desde)
+            base = construir_base(cur, args.patrones, args.tickets_por_patron,
+                                  args.desde, metodo=args.metodo)
         else:
             print(f"[base] cache: {len(base['tids'])} tickets")
 

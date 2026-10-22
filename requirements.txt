@@ -1,3 +1,5 @@
 numpy>=1.26
 scikit-learn>=1.4
 pyodbc>=5.1
+# opcional: proyeccion UMAP (--metodo umap)
+# umap-learn>=0.5
