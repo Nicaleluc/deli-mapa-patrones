@@ -1,4 +1,4 @@
-"""Conexion a Azure SQL (base Aoniken) leyendo credenciales de .env.
+"""Conexion a Azure SQL leyendo credenciales de .env.
 
 Repo autocontenido: no depende del paquete `etl` del repo `deli`.
 """
