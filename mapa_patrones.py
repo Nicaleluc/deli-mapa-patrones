@@ -49,6 +49,35 @@ def _norm(X):
     return X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
 
 
+def _embeddings_sin_patron(cur, limite, lote=400):
+    """Muestra aleatoria de tickets con embedding y sin vinculo a patron."""
+    cur.execute("""
+        SELECT TOP (?) te.TicketId
+        FROM DS_Ticket_Embedding te WITH (NOLOCK)
+        WHERE te.Tipo = 'contexto'
+          AND NOT EXISTS (SELECT 1 FROM DS_Patron_Ticket pt WITH (NOLOCK)
+                          WHERE pt.TicketId = te.TicketId)
+        ORDER BY NEWID()
+    """, limite)
+    ids = [int(r[0]) for r in cur.fetchall()]
+    print(f"[completo] {len(ids)} tickets sin patron sorteados")
+    vec = {}
+    for i in range(0, len(ids), lote):
+        parte = ids[i:i + lote]
+        cur.execute(
+            f"SELECT TicketId, Embedding FROM DS_Ticket_Embedding WITH (NOLOCK) "
+            f"WHERE Tipo = 'contexto' AND TicketId IN ({','.join('?' * len(parte))})", *parte)
+        for tid, v in cur.fetchall():
+            arr = _vec(v)
+            if arr is not None:
+                vec[int(tid)] = arr
+        print(f"\r[completo] vectores sin patron {len(vec)}/{len(ids)}", end='', flush=True)
+    print()
+    tids = np.array(sorted(vec), dtype=np.int64)
+    X = _norm(np.vstack([vec[int(t)] for t in tids])) if len(tids) else np.empty((0, DIM), np.float32)
+    return tids, X
+
+
 def _proyectar(X, P, metodo="tsne", perp=None, seed=0):
     """PCA50 + (t-SNE | UMAP) sobre los tickets. Devuelve (xy, var50, metodo_usado)."""
     from sklearn.decomposition import PCA
@@ -110,7 +139,8 @@ def _vectores_patrones(cur):
     return np.array(ids, dtype=np.int32), _norm(np.vstack(vecs)), meta
 
 
-def construir_base(cur, top_patrones, por_patron, min_ticket=400000, metodo='tsne'):
+def construir_base(cur, top_patrones, por_patron, min_ticket=400000, metodo='tsne',
+                   sin_patron=0):
     ids_all, P_all, meta_all = _vectores_patrones(cur)
     print(f"[base] {len(ids_all)} patrones activos con embedding")
 
@@ -167,9 +197,20 @@ def construir_base(cur, top_patrones, por_patron, min_ticket=400000, metodo='tsn
     tids = np.array(sorted(mejor), dtype=np.int64)
     pids = np.array([mejor[int(t)] for t in tids], dtype=np.int32)
     X = _norm(np.vstack([vectores[int(t)] for t in tids]))
-    print(f"[base] matriz de tickets: {X.shape}")
+    print(f"[base] matriz de tickets con patron: {X.shape}")
 
-    xy, var50, metodo_usado = _proyectar(X, P_all, metodo=metodo)
+    fondo_ids = np.empty(0, dtype=np.int64)
+    X_fondo = np.empty((0, DIM), dtype=np.float32)
+    if sin_patron:
+        fondo_ids, X_fondo = _embeddings_sin_patron(cur, sin_patron)
+
+    if len(fondo_ids):
+        xy_todo, var50, metodo_usado = _proyectar(
+            np.vstack([X, X_fondo]), P_all, metodo=metodo)
+        xy, xy_fondo = xy_todo[:len(X)], xy_todo[len(X):]
+    else:
+        xy, var50, metodo_usado = _proyectar(X, P_all, metodo=metodo)
+        xy_fondo = np.empty((0, 2), dtype=np.float32)
 
     np.savez_compressed(
         os.path.join(OUT, 'base.npz'),
@@ -177,12 +218,13 @@ def construir_base(cur, top_patrones, por_patron, min_ticket=400000, metodo='tsn
         P=P_all, patronVecIds=ids_all, var50=np.array([var50], dtype=np.float32),
         params=np.array([top_patrones, por_patron], dtype=np.int32),
         desde=np.array([min_ticket], dtype=np.int64),
-        metodo=np.array([0 if metodo_usado == 'tsne' else 1], dtype=np.int32))
+        metodo=np.array([0 if metodo_usado == 'tsne' else 1], dtype=np.int32),
+        fondo=xy_fondo.astype(np.float32))
     with open(os.path.join(OUT, 'base_meta.json'), 'w', encoding='utf-8') as fh:
         json.dump({str(k): v for k, v in meta_all.items()}, fh, ensure_ascii=False)
     return dict(X=X, xy=xy, tids=tids, pids=pids, P=P_all, pmid=ids_all,
                 meta=meta_all, var50=var50, params=(top_patrones, por_patron),
-                metodo=metodo_usado)
+                metodo=metodo_usado, fondo=xy_fondo)
 
 
 def cargar_base(params, min_ticket=400000):
@@ -199,7 +241,8 @@ def cargar_base(params, min_ticket=400000):
               f"pediste >= {min_ticket}; se rehace")
         return None
     return dict(X=d['X'], xy=d['xy'], tids=d['ticketIds'], pids=d['patronIds'],
-                P=d['P'], pmid=d['patronVecIds'], meta={}, var50=float(d['var50'][0]))
+                P=d['P'], pmid=d['patronVecIds'], meta={}, var50=float(d['var50'][0]),
+                fondo=d['fondo'] if 'fondo' in d else np.empty((0, 2), dtype=np.float32))
 
 
 def cargar_meta_json():
@@ -213,7 +256,7 @@ def cargar_meta_json():
 
 def construir_demo(n_patrones=18, n_tickets=2500, seed=7, ruido=1.15, cruzados=0.08,
                    mezcla=0.15, peso_mezcla=0.5, compactacion=0.70, perp=20,
-                   metodo='tsne'):
+                   metodo='tsne', sin_patron=0.25):
     """Dataset 100% sintetico: permite publicar el repo sin datos reales.
 
     Genera n_patrones centroides en 768d, les asigna tickets con ruido y
@@ -264,14 +307,21 @@ def construir_demo(n_patrones=18, n_tickets=2500, seed=7, ruido=1.15, cruzados=0
 
     xy, var50, metodo_usado = _proyectar(X, centros, metodo=metodo, perp=perp)
     perplexity = perp or min(40, max(5, n_tickets // 60))
+    # fraccion sin patron: se dibuja en negro (capa de fondo), fuera del K-NN
+    sinp = (rng.random(n_tickets) < sin_patron) if sin_patron > 0 \
+        else np.zeros(n_tickets, dtype=bool)
+    fondo = xy[sinp]
+    keep = ~sinp
+    X, xy, tids, pids = X[keep], xy[keep], tids[keep], pids[keep]
     print(f"[demo] {n_tickets} tickets sintéticos · {n_patrones} patrones · "
           f"ruido {ruido} · mezcla {mezcla:.0%} · compactación {compactacion} · "
           f"perp {perplexity} · PCA 50 dims {var50:.1f}%")
 
 
+    print(f"[demo] {int(sinp.sum())} tickets sin patrón (negro)")
     return dict(X=X, xy=xy, tids=tids, pids=pids, P=centros,
                 pmid=np.arange(1, n_patrones + 1, dtype=np.int32),
-                meta=meta, var50=var50)
+                meta=meta, var50=var50, fondo=fondo)
 
 
 def construir_html(base, archivo='mapa_patrones.html'):
@@ -309,7 +359,12 @@ def construir_html(base, archivo='mapa_patrones.html'):
                        'x': round(float(xy[j, 0]), 2), 'y': round(float(xy[j, 1]), 2),
                        'np': np1, 'ns': round(float(sims[j, orden[j, 0]]), 3)})
 
+    fondo = base.get('fondo')
+    fondo_payload = ([[round(float(a), 2), round(float(b), 2)] for a, b in fondo]
+                     if fondo is not None and len(fondo) else [])
+
     payload = dict(
+        fondo=fondo_payload,
         puntos=puntos,
         patrones=[dict(id=p, n=n_por_patron[p],
                        cx=round(float(centro[p][0]), 2), cy=round(float(centro[p][1]), 2),
@@ -321,7 +376,7 @@ def construir_html(base, archivo='mapa_patrones.html'):
         metricas=dict(coincide=round(coincide, 4), trust=round(trust, 4),
                       sil2=round(sil2, 4), sil768=round(sil768, 4),
                       var50=round(base['var50'], 1),
-                      n=len(puntos), patrones=len(presentes),
+                      n=len(puntos), fondo=len(fondo_payload), patrones=len(presentes),
                       patrones_total=len(pmid)))
 
     ruta = os.path.join(SALIDA, archivo)
@@ -434,6 +489,7 @@ th{color:var(--muted);font-weight:600;font-size:10.5px;text-transform:uppercase}
       <button id="zoomPunto">zoom al punto</button>
       <button id="btnLazo">lazo</button>
       <label class="sub" style="margin:0 0 0 6px"><input id="chkDens" type="checkbox"> densidad</label>
+      <label class="sub" style="margin:0 0 0 6px" title="tickets sin patrón asignado"><input id="chkFondo" type="checkbox" checked> sin patrón</label>
       <label class="sub" style="margin:0 0 0 6px">K
         <input id="kIn" type="number" min="1" max="60" step="1" value="7" style="width:56px;text-align:center">
       </label>
@@ -455,7 +511,7 @@ th{color:var(--muted);font-weight:600;font-size:10.5px;text-transform:uppercase}
       </label>
 
     </div>
-    <div class="hint"><b>clic en el mapa = poner un punto y calcular K vecinos</b> · umbral = similitud mínima (1 = solo el más cercano · 0 = todos los K) · rueda = zoom · arrastre = mover · ejes en unidades t-SNE (adimensionales)</div>
+    <div class="hint"><b>clic en el mapa = poner un punto y calcular K vecinos</b> · umbral = similitud mínima (1 = solo el más cercano · 0 = todos los K) · negro = ticket sin patrón · rueda = zoom · arrastre = mover · ejes en unidades t-SNE (adimensionales)</div>
   </div>
 </div>
 <div class="tip" id="tip"></div>
@@ -465,7 +521,7 @@ const cv=document.getElementById('cv'), ctx=cv.getContext('2d'), tip=document.ge
 let W=0,H=0,esc=1,ox=0,oy=0,hover=null,drag=null,puntoPx=2.4;
 let puntoKNN=null, resKNN=null;
 let K=7, UMBRAL=0.8;
-let mostrarDens=false, modoLazo=false, lazo=null, lazoListo=false, seleccion=[];
+let mostrarDens=false, mostrarFondo=true, modoLazo=false, lazo=null, lazoListo=false, seleccion=[];
 const dpr=Math.min(2, window.devicePixelRatio||1);
 
 // ---------- colores ----------
@@ -525,7 +581,8 @@ function recomputar(){
   visPts=D.puntos.filter(p=>visPat.has(p.p));
   const puntosVis=D.puntos.reduce((a,p)=>a+(visPat.has(p.p)?1:0),0);
   document.getElementById('resumen').innerHTML=
-    `<b>${visPat.size}</b> de ${D.patrones.length} patrones · <b>${puntosVis}</b> de ${D.puntos.length} tickets`;
+    `<b>${visPat.size}</b> de ${D.patrones.length} patrones · <b>${puntosVis}</b> de ${D.puntos.length} tickets`
+    + (D.fondo && D.fondo.length ? ` · <b>${D.fondo.length}</b> sin patrón` : '');
   FACETS.forEach(f=>{
     const el=document.getElementById('cnt_'+f.k);
     if(el) el.textContent=`${sel[f.k].size}/${cnt[f.k].size}`;
@@ -753,6 +810,29 @@ function drawGrid(){
   ctx.fillText('t-SNE 1',8,H-4);
   ctx.save(); ctx.translate(12,16); ctx.rotate(Math.PI/2); ctx.fillText('t-SNE 2',0,0); ctx.restore();
 }
+const fondoCv=document.createElement('canvas');
+let fondoKey='';
+function dibujarFondo(){
+  if(!mostrarFondo || !D.fondo || !D.fondo.length) return;
+  const key=[W,H,esc.toFixed(4),ox.toFixed(2),oy.toFixed(2)].join('|');
+  if(key!==fondoKey){
+    fondoCv.width=Math.max(1,Math.round(W*dpr));
+    fondoCv.height=Math.max(1,Math.round(H*dpr));
+    const g=fondoCv.getContext('2d');
+    g.setTransform(dpr,0,0,dpr,0,0);
+    g.clearRect(0,0,W,H);
+    g.fillStyle='rgba(15,23,42,0.42)';
+    const s=Math.max(1,Math.round(dpr));
+    for(let i=0;i<D.fondo.length;i++){
+      const x=Math.round(tx(D.fondo[i][0])), y=Math.round(ty(D.fondo[i][1]));
+      if(x<-2||y<-2||x>W+2||y>H+2) continue;
+      g.fillRect(x,y,s,s);
+    }
+    fondoKey=key;
+  }
+  ctx.drawImage(fondoCv,0,0,W,H);
+}
+
 const densCanvas=document.createElement('canvas');
 function dibujarDensidad(){
   const G=110, g=densCanvas.getContext('2d');
@@ -790,6 +870,7 @@ function draw(){
   if(!W||!H) return;
   ctx.clearRect(0,0,W,H); ctx.fillStyle='#fff'; ctx.fillRect(0,0,W,H);
   drawGrid();
+  dibujarFondo();
   if(mostrarDens) dibujarDensidad();
   ctx.globalAlpha=mostrarDens?0.30:0.45;
   const r=puntoPx;
@@ -987,6 +1068,9 @@ document.getElementById('btnLazo').onclick=()=>{
   draw();
 };
 document.getElementById('chkDens').onchange=e=>{mostrarDens=e.target.checked;draw();};
+document.getElementById('chkFondo').onchange=e=>{
+  mostrarFondo=e.target.checked; fondoKey=''; draw();
+};
 document.getElementById('selCsv').onclick=bajarCSV;
 document.getElementById('selClear').onclick=()=>{
   seleccion=[]; lazo=null; lazoListo=false;
@@ -1043,7 +1127,8 @@ const m=D.metricas;
 document.getElementById('sub').textContent =
   `${m.n} tickets · ${m.patrones} patrones dibujados · K-NN contra ${m.patrones_total} patrones activos · PCA50 ${m.var50}% + t-SNE`;
 document.getElementById('metricas').innerHTML=`
- <div class="kpi"><span>Puntos</span><b>${m.n}</b></div>
+ <div class="kpi"><span>Puntos con patrón</span><b>${m.n}</b></div>
+ <div class="kpi"><span>Sin patrón (negro)</span><b>${m.fondo||0}</b></div>
  <div class="kpi"><span>Patrones dibujados / total</span><b>${m.patrones} / ${m.patrones_total}</b></div>
  <div class="kpi"><span>Fidelidad de vecindad</span><b>${(m.trust*100).toFixed(1)}%</b></div>
  <div class="kpi"><span>Separación 2D (silhouette)</span><b>${m.sil2.toFixed(3)}</b></div>
@@ -1063,6 +1148,8 @@ def main():
     ap.add_argument('--tickets-por-patron', type=int, default=55)
     ap.add_argument('--desde', type=int, default=400000,
                     help='TicketId minimo a muestrear (400000 por defecto; 0 = todo el historial)')
+    ap.add_argument('--completo', type=int, default=0,
+                    help='incluye N tickets sin patron en negro (0 = no; 272604 = todos)')
     ap.add_argument('--metodo', choices=['tsne', 'umap'], default='tsne',
                     help='proyeccion 2D: t-SNE (default) o UMAP (requiere umap-learn)')
     ap.add_argument('--refresh', action='store_true')
@@ -1074,6 +1161,8 @@ def main():
                     help='dispersion de los clusters sinteticos (mas alto = mas superpuestos)')
     ap.add_argument('--demo-cruzados', type=float, default=0.08,
                     help='fraccion de tickets con etiqueta cruzada (0 a 1)')
+    ap.add_argument('--demo-sin-patron', type=float, default=0.25,
+                    help='fraccion del demo sin patron (se dibuja en negro)')
     ap.add_argument('--demo-mezcla', type=float, default=0.15,
                     help='fraccion de tickets a mitad de camino entre dos patrones (solapamiento)')
     ap.add_argument('--demo-compacidad', type=float, default=0.70,
@@ -1085,7 +1174,8 @@ def main():
     if args.demo:
         base = construir_demo(ruido=args.demo_ruido, cruzados=args.demo_cruzados,
                               mezcla=args.demo_mezcla, compactacion=args.demo_compacidad,
-                              perp=args.demo_perp or None, metodo=args.metodo)
+                              perp=args.demo_perp or None, metodo=args.metodo,
+                              sin_patron=args.demo_sin_patron)
         construir_html(base, 'demo.html')
         return
 
@@ -1106,8 +1196,12 @@ def main():
     try:
         base = None if args.refresh else cargar_base(params, args.desde)
         if base is None:
+            if args.completo and args.metodo == 'tsne':
+                print('[aviso] --completo con t-SNE puede ser muy lento; '
+                      'conviene --metodo umap')
             base = construir_base(cur, args.patrones, args.tickets_por_patron,
-                                  args.desde, metodo=args.metodo)
+                                  args.desde, metodo=args.metodo,
+                                  sin_patron=args.completo)
         else:
             print(f"[base] cache: {len(base['tids'])} tickets")
 

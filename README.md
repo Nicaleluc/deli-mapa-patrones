@@ -26,6 +26,7 @@ No necesita base de datos ni credenciales. El aspecto del demo se ajusta con:
 | `--demo-perp` | 20 | perplexity del t-SNE (0 = automático) |
 | `--demo-ruido` | 1.15 | dispersión interna de cada grupo |
 | `--demo-cruzados` | 0.08 | fracción de etiquetas mal asignadas |
+| `--demo-sin-patron` | 0.25 | fracción del demo sin patrón (se dibuja en negro) |
 | `--metodo` | `tsne` | `umap` para usar UMAP (requiere `pip install umap-learn`) |
 
 ## Qué hace
@@ -36,6 +37,7 @@ No necesita base de datos ni credenciales. El aspecto del demo se ajusta con:
   tipo de gestión y patrón** (con `seleccionar todo`, `ninguno` y `solo` por valor).
 - **Click en el mapa** → coloca un punto y calcula los **K vecinos** (K 1–60) y, con un
   **umbral de similitud** (0–1), decide **qué patrón debería ser**.
+- **Tickets sin patrón**: se dibujan en **negro** como capa de fondo (checkbox para ocultarlos).
 - **Densidad (KDE)**: capa de calor opcional para ver dónde está la masa de tickets.
 - **Lazo**: dibujá un polígono y selecciona todos los tickets de adentro; la tarjeta
   muestra el conteo por patrón y permite **exportar la selección a CSV**.
@@ -73,6 +75,7 @@ py -u mapa_patrones.py           # consulta la base, calcula y genera salida/map
 | `--desde` | `400000` | id de ticket mínimo a muestrear |
 | `--refresh` | — | rehace muestra + PCA/t-SNE |
 | `--metodo` | `tsne` | `umap` para proyectar con UMAP |
+| `--completo` | `0` | incluye N tickets **sin patrón** en negro (`272604` = todos) |
 | `--offline` | — | no toca la base; reusa `datos/base.npz` |
 | `--demo` | — | datos sintéticos, sin base |
 
@@ -104,5 +107,7 @@ salida/              mapa_patrones.html (o demo.html)
   silhouette 2D baja aunque la proyección sea buena: mirar `trustworthiness`
   (en el panel «Calidad del mapa»).
 - Los filtros facetados son **atributos del patrón**, no del ticket.
+- `--completo` con el universo entero (272.604 sin patrón) tarda ~30 min de lectura
+  más la proyección UMAP; conviene correrlo una vez y reusar `datos/base.npz`.
 - **UMAP** (--metodo umap) queda como opción: en este dataset es ~3x más lento que
   t-SNE (36 s vs 12 s para 2.500 puntos) y deja los grupos más separados, no más juntos.
