@@ -1,0 +1,14 @@
+# credenciales
+.env
+
+# datos y artefactos con datos reales (NUNCA versionar)
+datos/
+salida/mapa_patrones.html
+
+# python
+__pycache__/
+*.pyc
+
+# sistema
+Thumbs.db
+desktop.ini
